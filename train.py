@@ -6,6 +6,7 @@ import logging
 import torch
 import torch.utils.data
 import torchvision
+import sklearn
 
 import data_utils
 import trainer
@@ -28,7 +29,7 @@ def options(argv=None):
                         metavar='DATASET', help='dataset type')
     parser.add_argument('--data_type', default='synthetic', type=str,
                         metavar='DATASET', help='whether data is synthetic or real')
-    parser.add_argument('--categoryfile', type=str, default='./dataset/modelnet40_half1.txt',
+    parser.add_argument('--dictionaryfile', type=str, default='./dataset/modelnet40_half1.txt',
                         metavar='PATH', help='path to the categories to be trained')
     parser.add_argument('--num_points', default=1000, type=int,
                         metavar='N', help='points in point-cloud.')
@@ -153,8 +154,8 @@ def main(args):
 
 def get_datasets(args):
     cinfo = None
-    if args.categoryfile:
-        categories = [line.rstrip('\n') for line in open(args.categoryfile)]
+    if args.dictionaryfile:
+        categories = [line.rstrip('\n') for line in open(args.dictionaryfile)]
         categories.sort()
         c_to_idx = {categories[i]: i for i in range(len(categories))}
         cinfo = (categories, c_to_idx)
@@ -165,6 +166,8 @@ def get_datasets(args):
                     data_utils.OnUnitCube(),\
                     data_utils.Resampler(args.num_points)])
 
+        train_points, test_points, train_lbls, test_lbls = sklearn.model_selection.train_test_split(points, labels, test_size=0.2,
+                                                                                    random_state=42, stratify=True)
         traindata = data_utils.ModelNet(args.dataset_path, train=1, transform=transform, classinfo=cinfo)
         evaldata = data_utils.ModelNet(args.dataset_path, train=0, transform=transform, classinfo=cinfo)
 
