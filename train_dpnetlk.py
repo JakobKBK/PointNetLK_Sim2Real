@@ -110,8 +110,8 @@ class CustomDataset(torch.utils.data.Dataset):
 def main(ARGS):
 
     train_df, test_df = get_dataset(ARGS.path)
-    # dptnetlk = trainer.TrainerAnalyticalPointNetLK(ARGS)
-    # train(ARGS, train_df, test_df, dptnetlk)
+    dptnetlk = trainer.TrainerAnalyticalPointNetLK(ARGS)
+    train(ARGS, train_df, test_df, dptnetlk)
 
 
 def path_comprehension(path, file_name):
