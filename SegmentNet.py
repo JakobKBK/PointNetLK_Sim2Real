@@ -27,11 +27,11 @@ def options(argv=None):
                         metavar='N', help='number of data loading workers')
 
     # settings for training.
-    parser.add_argument('--batch_size', default=32, type=int,
+    parser.add_argument('--batch_size', default=10, type=int,
                         metavar='N', help='mini-batch size')
     parser.add_argument('--max_iter', default=1e3, type=int,
                         metavar='N', help='max iter voxel down')
-    parser.add_argument('--max_epochs', default=2, type=int,
+    parser.add_argument('--max_epochs', default=60, type=int,
                         metavar='N', help='number of total epochs to run') #default 200
     parser.add_argument('--start_epoch', default=0, type=int,
                         metavar='N', help='manual epoch number')
@@ -96,17 +96,22 @@ class CustomDataset(torch.utils.data.Dataset):
 
         if len(dp) > self.num_points_set:
             dp = self.__voxel_down_sample_to_n(self, dp, voxel)
-            print(f'output shape after vox down: {len(dp)}')
 
         if len(dp) < self.num_points_set:
             dp = self.__add_padding(self, dp)
 
-        if label.shape.numel() != dp.shape[0]:
-            label = self.__align_lbls(label, dp.shape[0])
+        if label.shape.numel() < dp.shape[0]:
+            n_repeats = dp.shape[0] - label.shape.numel()
+            label = self.__align_lbls(label, n_repeats)
 
+        if label.shape.numel() > dp.shape[0]:
+            label = self.__shorten_lbls(label, self.num_points_set)
+
+        label_long = label.long().to(dtype=torch.int32)
         dp = torch.tensor(dp.values)
 
-        return dp, label
+        return dp, label_long
+    
 
     @staticmethod
     def __add_padding(self, dp):
@@ -116,10 +121,16 @@ class CustomDataset(torch.utils.data.Dataset):
         return dp
 
     @staticmethod
-    def __align_lbls(label, num_columns):
-        repeated_labels = label.repeat(num_columns)
+    def __align_lbls(label, n_repeats):
+        repeated_labels = label.repeat(n_repeats+1)
 
         return repeated_labels
+
+    @staticmethod
+    def __shorten_lbls(label, n_labels):
+        shortened_labels = label[:n_labels]
+        return shortened_labels
+
 
     @staticmethod
     def __voxel_down_sample_to_n(self, dp, voxel):
@@ -191,6 +202,9 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
     print(f"Steps per epoch: {steps_per_epoch}.")
     print(f"Total training steps: {total_training_steps}.")
 
+    print(f'train_df: {train_df.head}.')
+    print(f'test_df: {test_df.head}.')
+
     train_costum = CustomDataset(train_df, ARGS)
     test_costum = CustomDataset(test_df, ARGS)
 
@@ -200,6 +214,10 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
     test_loader = torch.utils.data.DataLoader(test_costum, batch_size=ARGS.batch_size, shuffle=False,
                                               num_workers=ARGS.workers, drop_last=True)
 
+    data, labels = test_loader
+    print(f'data test_loader: {data}, labels  test_loader: {labels}')
+    data, labels, *_ = train_loader
+    print(f'data shape train_loader: {len(data)}, labels shape test_loader: {len(labels)}')
 
     lr_schedule = keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate=ARGS.lr,
@@ -207,9 +225,6 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
         decay_rate=ARGS.decay_rate,
         staircase=True,
     )
-
-    steps = range(total_training_steps)
-    lrs = [lr_schedule(step) for step in steps]
 
     segmentnet.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
@@ -249,7 +264,7 @@ def mlp_block(x, filters, name):
 
 
 def get_segmentation_model(n_classes, ARGS):
-    input_points = keras.Input(shape=(None, 3))
+    input_points = keras.Input(shape=(ARGS.num_points, 3))
 
     # PointNet Classification Network.
     transformed_inputs = transformation_block(
