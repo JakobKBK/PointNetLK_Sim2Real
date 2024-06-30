@@ -2,6 +2,7 @@ import torch
 from sklearn.model_selection import train_test_split
 import keras
 from keras import layers
+import tensorflow as tf
 from pyntcloud import PyntCloud
 import open3d as o3d
 import argparse
@@ -19,7 +20,7 @@ def options(argv=None):
     # settings for input data
     parser.add_argument('--data_type', default='synthetic', type=str,
                         metavar='DATASET', help='whether data is synthetic or real')
-    parser.add_argument('--dictionaryfile', type=str, default=r'"C:\MaH_Kretschmer\data\train_data\DEMO_EMO\dictionary.pkl"',
+    parser.add_argument('--dictionaryfile', type=str, default=r'C:\MaH_Kretschmer\data\train_data\DEMO_EMO\dictionary.pkl',
                         metavar='PATH', help='path to the categories to be trained')
     parser.add_argument('--num_points', default=2048, type=int,
                         metavar='N', help='points in point-cloud.')
@@ -61,57 +62,87 @@ def options(argv=None):
 
 def main(ARGS):
 
-    train_df, test_df, n_classes, max_voxel = get_dataset(ARGS.path)
+    train_df, test_df, n_classes, max_voxel = get_dataset()
     segmentnet = get_segmentation_model(n_classes, ARGS)
     model, history = train(ARGS, train_df, test_df, max_voxel, segmentnet)
     model.save(f'{ARGS.path_model}\segmentnet.keras')
 
 
-class CustomDataset(torch.utils.data.Dataset):
+class CustomDataloader(keras.utils.Sequence):
 
-    def __init__(self, data, ARGS):
+    def __init__(self, data, dictionary, shuffle, ARGS):
+        super().__init__()
         self.data = data.loc['path']
         self.lbls = data.loc['labels']
         self.voxel_size = data.loc['voxel_size']
         self.num_points_set = ARGS.num_points
         self.max_iter = ARGS.max_iter
+        self.indexes = np.arange(len(data.columns))
+        self.n_classes = len(dictionary)+1  # accounting for the additional 'background' or 'unlabeled' class
+        self.shuffle = shuffle
+        self.keys_lbl = np.array(list(dictionary.keys()))
+        self.label_to_index = {label: index for index, label in enumerate(self.keys_lbl)}
+        self.on_epoch_end()
 
     def __len__(self):
         return self.data.shape[0]
 
     def __getitem__(self, idx):
-        label = self.lbls.iloc[idx]
-        path_dp = self.data.iloc[idx]
-        voxel = self.voxel_size.iloc[idx]
-        cloud_temp = PyntCloud.from_file(path_dp)
-        dp = cloud_temp.points
-        label = torch.tensor(label)
+        indexes = self.indexes[idx * ARGS.batch_size:(idx + 1) * ARGS.batch_size]
+        data = np.empty((ARGS.batch_size, ARGS.num_points, 3))
+        label = np.empty((ARGS.batch_size, ARGS.num_points, self.n_classes), dtype=int)
+        for i, idx in enumerate(indexes):
+            label_src = self.lbls.iloc[idx]
+            path_dp = self.data.iloc[idx]
+            voxel = self.voxel_size.iloc[idx]
+            cloud_temp = PyntCloud.from_file(path_dp)
+            dp = cloud_temp.points
+            label_src = torch.tensor(label_src)
 
-        if np.random.rand() < 0.05:
-            # Generate a random scale factor between 0 and 2
-            scale_factor = 2 * np.random.rand()
+            if np.random.rand() < 0.05:
+                # Generate a random scale factor between 0 and 2
+                scale_factor = 2 * np.random.rand()
 
-            # Scale the point cloud
-            dp *= scale_factor
+                # Scale the point cloud
+                dp *= scale_factor
 
-        if len(dp) > self.num_points_set:
-            dp = self.__voxel_down_sample_to_n(self, dp, voxel)
+            if len(dp) > self.num_points_set:
+                dp = self.__voxel_down_sample_to_n(self, dp, voxel)
 
-        if len(dp) < self.num_points_set:
-            dp = self.__add_padding(self, dp)
+            if len(dp) < self.num_points_set:
+                dp = self.__add_padding(self, dp)
 
-        if label.shape.numel() < dp.shape[0]:
-            n_repeats = dp.shape[0] - label.shape.numel()
-            label = self.__align_lbls(label, n_repeats)
+            if label_src.shape.numel() < dp.shape[0]:
+                n_repeats = dp.shape[0] - label_src.shape.numel()
+                label_src = self.__align_lbls(label_src, n_repeats)
 
-        if label.shape.numel() > dp.shape[0]:
-            label = self.__shorten_lbls(label, self.num_points_set)
+            if label_src.shape.numel() > dp.shape[0]:
+                label_src = self.__shorten_lbls(label_src, self.num_points_set)
 
-        label_long = label.long().to(dtype=torch.int32)
-        dp = torch.tensor(dp.values)
+            label_np = label_src.numpy().astype(np.int32)
+            points = dp.to_numpy()
+            data[i,] = points
+            label[i] = self.to_one_hot_enc_lbls(label_np)
 
-        return dp, label_long
-    
+        return data, label
+
+    def to_one_hot_enc_lbls(self, labels):
+        get_index_or_negative_one = lambda label: self.label_to_index.get(label, -1)
+        vectorized_function = np.vectorize(get_index_or_negative_one)
+        label_indices = vectorized_function(labels)
+        one_hot_labels = np.eye(self.n_classes)[label_indices + 1]
+        return one_hot_labels
+
+    def mask_unknown(self, array):
+        mask = ~np.isin(array, list(np.array(list(self.label_to_index.values()))))
+        array[mask] = -1
+
+        return array
+
+    def on_epoch_end(self):
+        """Updates indexes after each epoch"""
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
 
     @staticmethod
     def __add_padding(self, dp):
@@ -199,25 +230,12 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
     total_training_examples = len(train_df.columns) + len(test_df.columns)
     steps_per_epoch = total_training_examples // ARGS.batch_size
     total_training_steps = steps_per_epoch * ARGS.max_epochs
+    dictionary = pd.read_pickle(ARGS.dictionaryfile)
     print(f"Steps per epoch: {steps_per_epoch}.")
     print(f"Total training steps: {total_training_steps}.")
 
-    print(f'train_df: {train_df.head}.')
-    print(f'test_df: {test_df.head}.')
-
-    train_costum = CustomDataset(train_df, ARGS)
-    test_costum = CustomDataset(test_df, ARGS)
-
-    train_loader = torch.utils.data.DataLoader(train_costum, batch_size=ARGS.batch_size, shuffle=True,
-                                               num_workers=ARGS.workers, drop_last=True)
-
-    test_loader = torch.utils.data.DataLoader(test_costum, batch_size=ARGS.batch_size, shuffle=False,
-                                              num_workers=ARGS.workers, drop_last=True)
-
-    data, labels = test_loader
-    print(f'data test_loader: {data}, labels  test_loader: {labels}')
-    data, labels, *_ = train_loader
-    print(f'data shape train_loader: {len(data)}, labels shape test_loader: {len(labels)}')
+    train_loader = CustomDataloader(train_df, dictionary, True, ARGS)
+    test_loader = CustomDataloader(test_df, dictionary, False, ARGS)
 
     lr_schedule = keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate=ARGS.lr,
@@ -228,8 +246,8 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
 
     segmentnet.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
-        loss=keras.losses.CategoricalCrossentropy(),
-        metrics=["accuracy"],
+        loss=custom_loss(len(dictionary)+1),
+        metrics=["accuracy"]
     )
 
     checkpoint_filepath = f'{ARGS.path_model}\checkpoint.weights.h5'
@@ -243,12 +261,20 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
     history = segmentnet.fit(
         train_loader,
         validation_data=test_loader,
+        batch_size=ARGS.batch_size,
         epochs=ARGS.max_epochs,
         callbacks=[checkpoint_callback],
     )
 
     segmentnet.load_weights(checkpoint_filepath)
     return segmentnet, history
+
+
+def custom_loss(number_of_classes):
+    def loss(y_true, y_pred):
+        crossentropy_loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+        return tf.reduce_mean(crossentropy_loss)
+    return loss
 
 
 def conv_block(x, filters, name):
@@ -331,14 +357,14 @@ def transformation_block(inputs, num_features, name):
     return layers.Dot(axes=(2, 1), name=f"{name}_mm")([inputs, transformed_features])
 
 
-def get_dataset(directory):
+def get_dataset():
     search_string: str = 'data_df'
     row_names = ['path', 'voxel_size', 'labels']
     df_paths = pd.DataFrame(index=row_names)
 
-    for filename in os.listdir(directory):
+    for filename in os.listdir(ARGS.path):
         if filename.endswith(".pkl") and search_string in filename:
-            file_path = os.path.join(directory, filename)
+            file_path = os.path.join(ARGS.path, filename)
 
             try:
                 # Load the dataframe from pickle file
@@ -349,7 +375,8 @@ def get_dataset(directory):
             except Exception as e:
                 print(f"Failed to load {filename}: {e}")
 
-    n_classes = len(get_unique_lbls(df_paths.loc['labels']))
+    dictionary = pd.read_pickle(ARGS.dictionaryfile)
+    n_classes = len(dictionary)+1
     max_voxel = df_paths.loc['voxel_size'].max()
     train_df, test_df = train_test_split(df_paths.T, test_size=0.2, random_state=42)
     return train_df.T, test_df.T, n_classes, max_voxel
