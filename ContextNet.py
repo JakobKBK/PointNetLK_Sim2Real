@@ -63,18 +63,31 @@ def options(argv=None):
 def main(ARGS):
 
     train_df, test_df, n_classes, max_voxel = get_dataset()
-    segmentnet = get_segmentation_model(n_classes, ARGS)
-    model, history = train(ARGS, train_df, test_df, max_voxel, segmentnet)
-    model.save(f'{ARGS.path_model}\segmentnet.keras')
+    contextnet = get_segmentation_model(n_classes, ARGS)
+    model, history = train(ARGS, train_df, test_df, max_voxel, contextnet)
+    model.save(f'{ARGS.path_model}\contextnet.keras')
 
 
 class CustomDataloader(keras.utils.Sequence):
 
     def __init__(self, data, dictionary, shuffle, ARGS):
         super().__init__()
-        self.data = data.loc['path']
+        self.path = data.loc['path']
         self.lbls = data.loc['labels']
         self.voxel_size = data.loc['voxel_size']
+        self.fpfh_points_large = data.loc['fpfh']
+        self.fpfh_small = None
+        self.normals_points_large = data.loc['normals']
+        self.normals_small = None
+        self.point_var_x = data.loc['point_variance_x']
+        self.point_var_y = data.loc['point_variance_y']
+        self.point_var_z = data.loc['point_variance_z']
+        self.point_skew_x = data.loc['point_skew_x']
+        self.point_skew_y = data.loc['point_skew_y']
+        self.point_skew_z = data.loc['point_skew_z']
+        self.relative_prop = data.loc['rel_proportion']
+        self.density_cloud = data.loc['density']
+        self.center_of_mass = data.loc['com']
         self.num_points_set = ARGS.num_points
         self.max_iter = ARGS.max_iter
         self.indexes = np.arange(len(data.columns))
@@ -89,20 +102,26 @@ class CustomDataloader(keras.utils.Sequence):
 
     def __getitem__(self, idx):
         indexes = self.indexes[idx * ARGS.batch_size:(idx + 1) * ARGS.batch_size]
-        data = np.empty((ARGS.batch_size, ARGS.num_points, 6))
-        label = np.empty((ARGS.batch_size, 16), dtype=float)
+        data = np.empty((ARGS.batch_size, ARGS.num_points*36+))
+        label = np.empty((ARGS.batch_size, self.n_classes), dtype=int)
         for i, idx in enumerate(indexes):
+            label_src = self.lbls.iloc[idx]
             path_dp = self.data.iloc[idx]
             voxel = self.voxel_size.iloc[idx]
+            fpfh_large = self.fpfh_points_large.iloc[idx].flatten()
+            normals_large = self.normals_points_large.iloc[idx]
+            var_x = self.point_var_x.iloc[idx]
+            var_y = self.point_var_y.iloc[idx]
+            var_z = self.point_var_z.iloc[idx]
+            skew_x = self.point_skew_x.iloc[idx]
+            skew_y = self.point_skew_y.iloc[idx]
+            skew_z = self.point_skew_z.iloc[idx]
+            rel_prop = self.relative_prop.iloc[idx]
+            density = self.density_cloud.iloc[idx]
+            com = self.center_of_mass.iloc[idx]
             cloud_temp = PyntCloud.from_file(path_dp)
             dp = cloud_temp.points
-
-            if np.random.rand() < 0.05:
-                # Generate a random scale factor between 0 and 2
-                scale_factor = 2 * np.random.rand()
-
-                # Scale the point cloud
-                dp *= scale_factor
+            label_src = torch.tensor(label_src)
 
             if len(dp) > self.num_points_set:
                 dp = self.__voxel_down_sample_to_n(self, dp, voxel)
@@ -110,12 +129,44 @@ class CustomDataloader(keras.utils.Sequence):
             if len(dp) < self.num_points_set:
                 dp = self.__add_padding(self, dp)
 
+            if label_src.shape.numel() < dp.shape[0]:
+                n_repeats = dp.shape[0] - label_src.shape.numel()
+                label_src = self.__align_lbls(label_src, n_repeats)
+
+            if label_src.shape.numel() > dp.shape[0]:
+                label_src = self.__shorten_lbls(label_src, self.num_points_set)
+
+            label_np = label_src.numpy().astype(np.int32)
             points = dp.to_numpy()
-            data[i,:,:2] = points
-            data[i, :, 3:] = points_transformed
+            data[i,] = points
             label[i] = self.to_one_hot_enc_lbls(label_np)
 
+            fpfh_small, normals_small = self.get_fpfh(self, points) #dims npointsx33 & npointsx3
+
         return data, label
+
+    def get_fpfh(self, points):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        fpfh_o3d = self.preprocess_point_cloud(pcd, self.voxel_size)
+        fpfh = np.asarray(fpfh_o3d.data)
+        normals_points = np.asarray(pcd.normals)
+
+        return fpfh.flatten(), normals_points.flatten()
+
+    def preprocess_point_cloud(self, pcd, voxel_size):
+
+        radius_normal = voxel_size * 2
+
+        pcd.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+
+        radius_feature = voxel_size * 5
+        pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pcd,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+        return pcd_fpfh
+
 
     def to_one_hot_enc_lbls(self, labels):
         get_index_or_negative_one = lambda label: self.label_to_index.get(label, -1)
