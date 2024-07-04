@@ -33,7 +33,7 @@ def options(argv=None):
     parser.add_argument('--max_iter', default=1e3, type=int,
                         metavar='N', help='max iter voxel down')
     parser.add_argument('--max_epochs', default=60, type=int,
-                        metavar='N', help='number of total epochs to run') #default 200
+                        metavar='N', help='number of total epochs to run')
     parser.add_argument('--start_epoch', default=0, type=int,
                         metavar='N', help='manual epoch number')
     parser.add_argument('--optimizer', default='Adam', type=str,
