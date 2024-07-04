@@ -14,6 +14,9 @@ import gc
 
 def options(argv=None):
     # io settings.
+    parser = argparse.ArgumentParser(description='SegmentNet')
+    parser.add_argument('--path', default=r'C:\MaH_Kretschmer\data\train_data\DEMO_EMO', type=str,
+                        metavar='PATH', help='path to data directory')
     parser.add_argument('--outfile', type=str, default='./logs/220524_train_log',
                         metavar='BASENAME', help='output filename (prefix)')
 
@@ -28,11 +31,11 @@ def options(argv=None):
                         metavar='N', help='number of data loading workers')
 
     # settings for training.
-    parser.add_argument('--batch_size', default=10, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         metavar='N', help='mini-batch size')
     parser.add_argument('--max_iter', default=1e3, type=int,
                         metavar='N', help='max iter voxel down')
-    parser.add_argument('--max_epochs', default=60, type=int,
+    parser.add_argument('--max_epochs', default=2, type=int,
                         metavar='N', help='number of total epochs to run') #default 200
     parser.add_argument('--start_epoch', default=0, type=int,
                         metavar='N', help='manual epoch number')
@@ -44,6 +47,8 @@ def options(argv=None):
                         metavar='D', help='learning rate')
     parser.add_argument('--decay_rate', type=float, default=1e-4,
                         metavar='D', help='decay rate of learning rate')
+    parser.add_argument('--omit_single_masks', type=bool, default=True,
+                        metavar='BOOL', help='wether to omit masked single part pointclouds')
     parser.add_argument('--path_model', type=str, default=r'C:\MaH_Kretschmer\data\models',
                         metavar='PATH', help='safe path for trained model .keras (prefix) & checkpoints')
 
@@ -221,8 +226,7 @@ class OrthogonalRegularizer(keras.regularizers.Regularizer):
         return keras.ops.sum(self.l2reg * keras.ops.square(xxt - self.identity))
 
     def get_config(self):
-        config = super().get_config()
-        config.update({"num_features": self.num_features, "l2reg_strength": self.l2reg})
+        config = {"num_features": self.num_features, "l2reg_strength": self.l2reg}
         return config
 
 
@@ -250,12 +254,15 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
         metrics=["accuracy"]
     )
 
-    checkpoint_filepath = f'{ARGS.path_model}\checkpoint.weights.h5'
+    checkpoint_filepath = f'{ARGS.path_model}/checkpoint.weights.h5'
     checkpoint_callback = keras.callbacks.ModelCheckpoint(
         checkpoint_filepath,
         monitor="val_loss",
         save_best_only=True,
         save_weights_only=True,
+        mode="auto",
+        save_freq="epoch",
+        initial_value_threshold=None,
     )
 
     history = segmentnet.fit(
@@ -366,14 +373,35 @@ def get_dataset():
         if filename.endswith(".pkl") and search_string in filename:
             file_path = os.path.join(ARGS.path, filename)
 
-            try:
-                # Load the dataframe from pickle file
-                df = pd.read_pickle(file_path)
-                df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
-                del df
-                gc.collect()
-            except Exception as e:
-                print(f"Failed to load {filename}: {e}")
+            if ARGS.omit_single_masks:
+
+                try:
+                    df = pd.read_pickle(file_path)
+                    cols_to_drop = []
+
+                    for col in df.columns:
+                        if 'assembly' not in df.loc['path', col]:
+                            cols_to_drop.append(col)
+
+                    # Drop the columns from the DataFrame
+                    df = df.drop(cols_to_drop, axis=1)
+
+                    df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
+                    del df
+                    gc.collect()
+                except Exception as e:
+                    print(f"Failed to load {filename}: {e}")
+
+            else:
+
+                try:
+                    # Load the dataframe from pickle file
+                    df = pd.read_pickle(file_path)
+                    df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
+                    del df
+                    gc.collect()
+                except Exception as e:
+                    print(f"Failed to load {filename}: {e}")
 
     dictionary = pd.read_pickle(ARGS.dictionaryfile)
     n_classes = len(dictionary)+1
@@ -394,8 +422,6 @@ def get_unique_lbls(df_row):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='SegmentNet')
-    parser.add_argument('--path', default=r'C:\MaH_Kretschmer\data\train_data\DEMO_EMO', type=str,
-                        metavar='PATH', help='path to data directory')
+
     ARGS = options()
     main(ARGS)
