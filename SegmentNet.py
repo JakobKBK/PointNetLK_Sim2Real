@@ -11,8 +11,6 @@ import pandas as pd
 import numpy as np
 import gc
 
-#this is a change for git
-
 
 def options(argv=None):
     # io settings.
