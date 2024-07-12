@@ -27,15 +27,17 @@ def options(argv=None):
                         metavar='PATH', help='path to the categories to be trained')
     parser.add_argument('--num_points', default=2048, type=int,
                         metavar='N', help='points in point-cloud.')
+    parser.add_argument('--min_points', default=32, type=int,
+                        metavar='N', help='minimum number of points in mask to be considered for training.')
     parser.add_argument('--workers', default=1, type=int,
                         metavar='N', help='number of data loading workers')
 
     # settings for training.
-    parser.add_argument('--batch_size', default=32, type=int,
+    parser.add_argument('--batch_size', default=64, type=int,
                         metavar='N', help='mini-batch size')
     parser.add_argument('--max_iter', default=1e3, type=int,
                         metavar='N', help='max iter voxel down')
-    parser.add_argument('--max_epochs', default=2, type=int,
+    parser.add_argument('--max_epochs', default=10, type=int,
                         metavar='N', help='number of total epochs to run') #default 200
     parser.add_argument('--start_epoch', default=0, type=int,
                         metavar='N', help='manual epoch number')
@@ -70,7 +72,7 @@ def main(ARGS):
     train_df, test_df, n_classes, max_voxel = get_dataset()
     segmentnet = get_segmentation_model(n_classes, ARGS)
     model, history = train(ARGS, train_df, test_df, max_voxel, segmentnet)
-    model.save(f'{ARGS.path_model}\segmentnet.keras')
+    model.save(f'{ARGS.path_model}\segmentnet_v1.keras')
 
 
 class CustomDataloader(keras.utils.Sequence):
@@ -96,38 +98,48 @@ class CustomDataloader(keras.utils.Sequence):
         indexes = self.indexes[idx * ARGS.batch_size:(idx + 1) * ARGS.batch_size]
         data = np.empty((ARGS.batch_size, ARGS.num_points, 3))
         label = np.empty((ARGS.batch_size, ARGS.num_points, self.n_classes), dtype=int)
+        j = 0
         for i, idx in enumerate(indexes):
-            label_src = self.lbls.iloc[idx]
-            path_dp = self.data.iloc[idx]
-            voxel = self.voxel_size.iloc[idx]
-            cloud_temp = PyntCloud.from_file(path_dp)
-            dp = cloud_temp.points
-            label_src = torch.tensor(label_src)
+            if j < ARGS.batch_size:
+                for part_id in self.keys_lbl:
+                    label_src = self.lbls.iloc[idx]
+                    if np.any(label_src == part_id):
+                        path_dp = self.data.iloc[idx]
+                        voxel = self.voxel_size.iloc[idx]
+                        cloud_temp = PyntCloud.from_file(path_dp)
+                        dp = cloud_temp.points
+                        dp, label_src = self.get_roi(dp, label_src, part_id)
+                        label_src = torch.tensor(label_src.to_numpy(), dtype=torch.float32)
 
-            if np.random.rand() < 0.05:
-                # Generate a random scale factor between 0 and 2
-                scale_factor = 2 * np.random.rand()
+                        if len(dp) > ARGS.min_points:
+                            if np.random.rand() < 0.05:
+                                # Generate a random scale factor between 0 and 2
+                                scale_factor = 2 * np.random.rand()
 
-                # Scale the point cloud
-                dp *= scale_factor
+                                # Scale the point cloud
+                                dp *= scale_factor
 
-            if len(dp) > self.num_points_set:
-                dp = self.__voxel_down_sample_to_n(self, dp, voxel)
+                            if len(dp) > self.num_points_set:
+                                dp = self.__voxel_down_sample_to_n(self, dp, voxel)
 
-            if len(dp) < self.num_points_set:
-                dp = self.__add_padding(self, dp)
+                            if len(dp) < self.num_points_set:
+                                dp = self.__add_padding(self, dp)
 
-            if label_src.shape.numel() < dp.shape[0]:
-                n_repeats = dp.shape[0] - label_src.shape.numel()
-                label_src = self.__align_lbls(label_src, n_repeats)
+                            if label_src.shape.numel() < dp.shape[0]:
+                                n_repeats = dp.shape[0] - label_src.shape.numel()
+                                label_src = self.__align_lbls(label_src, n_repeats)
 
-            if label_src.shape.numel() > dp.shape[0]:
-                label_src = self.__shorten_lbls(label_src, self.num_points_set)
+                            if label_src.shape.numel() > dp.shape[0]:
+                                label_src = self.__shorten_lbls(label_src, self.num_points_set)
 
-            label_np = label_src.numpy().astype(np.int32)
-            points = dp.to_numpy()
-            data[i,] = points
-            label[i] = self.to_one_hot_enc_lbls(label_np)
+                            label_np = label_src.numpy().astype(np.int32)
+                            points = dp.to_numpy()
+                            data[j,] = points
+                            label[j] = self.to_one_hot_enc_lbls(label_np)
+                            j += 1
+
+                else:
+                    return data, label
 
         return data, label
 
@@ -138,11 +150,51 @@ class CustomDataloader(keras.utils.Sequence):
         one_hot_labels = np.eye(self.n_classes)[label_indices + 1]
         return one_hot_labels
 
-    def mask_unknown(self, array):
-        mask = ~np.isin(array, list(np.array(list(self.label_to_index.values()))))
-        array[mask] = -1
+    def get_roi(self, dp, labels, part_id):
 
-        return array
+        df = pd.DataFrame(columns=['x', 'y', 'z', 'label'])
+        df[['x', 'y', 'z']] = dp[['x', 'y', 'z']]
+        df['label'] = labels
+        masked_df = df[df['label'] == part_id]
+        masked_df = masked_df.iloc[:, :-1]
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(masked_df.values)
+        o3d_bbox = pcd.get_oriented_bounding_box()
+        bbox_points = o3d_bbox.get_box_points()
+        bbox_coordinates = self.min_max_values_bbox(np.asarray(bbox_points))
+
+        roi_adjusted_df = df[
+            (df['x'] >= bbox_coordinates[0][0]) & (df['x'] <= bbox_coordinates[0][1]) &
+            (df['y'] >= bbox_coordinates[1][0]) & (df['y'] <= bbox_coordinates[1][1]) &
+            (df['z'] >= bbox_coordinates[2][0]) & (df['z'] <= bbox_coordinates[2][1])
+            ]
+
+        return roi_adjusted_df.iloc[:, :-1], roi_adjusted_df.iloc[:, -1]
+
+    def min_max_values_bbox(self, points, tol_ratio=0.5):
+        # Extract x, y, and z coordinates from the points
+        x_values = points[:, 0]
+        y_values = points[:, 1]
+        z_values = points[:, 2]
+
+        # Calculate minimum and maximum values for each dimension
+        min_x, max_x = np.min(x_values), np.max(x_values)
+        min_y, max_y = np.min(y_values), np.max(y_values)
+        min_z, max_z = np.min(z_values), np.max(z_values)
+
+        x_tol = tol_ratio * (max_x - min_x)
+        y_tol = tol_ratio * (max_y - min_y)
+        z_tol = tol_ratio * (max_z - min_z)
+
+        min_x = min_x - x_tol
+        max_x = max_x + x_tol
+        min_y = min_y - y_tol
+        max_y = max_y + y_tol
+        min_z = min_z - z_tol
+        max_z = max_z + z_tol
+
+        return [[min_x, max_x], [min_y, max_y], [min_z, max_z]]
 
     def on_epoch_end(self):
         """Updates indexes after each epoch"""
@@ -254,7 +306,7 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
         metrics=["accuracy"]
     )
 
-    checkpoint_filepath = f'{ARGS.path_model}/checkpoint.weights.h5'
+    checkpoint_filepath = f'{ARGS.path_model}/checkpoint_segmentnet_v1.weights.h5'
     checkpoint_callback = keras.callbacks.ModelCheckpoint(
         checkpoint_filepath,
         monitor="val_loss",

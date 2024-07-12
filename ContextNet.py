@@ -32,7 +32,7 @@ def options(argv=None):
                         metavar='N', help='mini-batch size')
     parser.add_argument('--max_iter', default=1e3, type=int,
                         metavar='N', help='max iter voxel down')
-    parser.add_argument('--max_epochs', default=2, type=int,
+    parser.add_argument('--max_epochs', default=10, type=int,
                         metavar='N', help='number of total epochs to run')
     parser.add_argument('--start_epoch', default=0, type=int,
                         metavar='N', help='manual epoch number')
@@ -44,8 +44,12 @@ def options(argv=None):
                         metavar='D', help='learning rate')
     parser.add_argument('--decay_rate', type=float, default=1e-4,
                         metavar='D', help='decay rate of learning rate')
+    parser.add_argument('--omit_single_masks', type=bool, default=False,
+                        metavar='BOOL', help='wether to omit masked single part pointclouds')
     parser.add_argument('--path_model', type=str, default=r'C:\MaH_Kretschmer\data\models',
                         metavar='PATH', help='safe path for trained model .keras (prefix) & checkpoints')
+    parser.add_argument('--leaky_slope', type=float, default=0.1,
+                        metavar='D', help='slope for leaky relu activation function')
 
     # settings for log
     parser.add_argument('--logfile', default='', type=str,
@@ -63,7 +67,7 @@ def options(argv=None):
 def main(ARGS):
 
     train_df, test_df, n_classes, max_voxel = get_dataset()
-    contextnet = get_segmentation_model(n_classes, ARGS)
+    contextnet = get_segmentation_model(ARGS, n_classes)
     model, history = train(ARGS, train_df, test_df, max_voxel, contextnet)
     model.save(f'{ARGS.path_model}\contextnet.keras')
 
@@ -72,13 +76,9 @@ class CustomDataloader(keras.utils.Sequence):
 
     def __init__(self, data, dictionary, shuffle, ARGS):
         super().__init__()
-        self.path = data.loc['path']
+        self.data = data.loc['path']
         self.lbls = data.loc['labels']
         self.voxel_size = data.loc['voxel_size']
-        self.fpfh_points_large = data.loc['fpfh']
-        self.fpfh_small = None
-        self.normals_points_large = data.loc['normals']
-        self.normals_small = None
         self.point_var_x = data.loc['point_variance_x']
         self.point_var_y = data.loc['point_variance_y']
         self.point_var_z = data.loc['point_variance_z']
@@ -102,26 +102,33 @@ class CustomDataloader(keras.utils.Sequence):
 
     def __getitem__(self, idx):
         indexes = self.indexes[idx * ARGS.batch_size:(idx + 1) * ARGS.batch_size]
-        data = np.empty((ARGS.batch_size, ARGS.num_points*36+))
+        data = np.empty((ARGS.batch_size, 36 * self.num_points_set + 12))
         label = np.empty((ARGS.batch_size, self.n_classes), dtype=int)
+
         for i, idx in enumerate(indexes):
+
             label_src = self.lbls.iloc[idx]
             path_dp = self.data.iloc[idx]
             voxel = self.voxel_size.iloc[idx]
-            fpfh_large = self.fpfh_points_large.iloc[idx].flatten()
-            normals_large = self.normals_points_large.iloc[idx]
             var_x = self.point_var_x.iloc[idx]
             var_y = self.point_var_y.iloc[idx]
             var_z = self.point_var_z.iloc[idx]
             skew_x = self.point_skew_x.iloc[idx]
             skew_y = self.point_skew_y.iloc[idx]
             skew_z = self.point_skew_z.iloc[idx]
-            rel_prop = self.relative_prop.iloc[idx]
+            proportion = self.relative_prop.iloc[idx]
             density = self.density_cloud.iloc[idx]
             com = self.center_of_mass.iloc[idx]
             cloud_temp = PyntCloud.from_file(path_dp)
             dp = cloud_temp.points
-            label_src = torch.tensor(label_src)
+            label_unique = np.unique(label_src)
+
+            if np.random.rand() < 0.05:
+                # Generate a random scale factor between 0 and 2
+                scale_factor = 2 * np.random.rand()
+
+                # Scale the point cloud
+                dp *= scale_factor
 
             if len(dp) > self.num_points_set:
                 dp = self.__voxel_down_sample_to_n(self, dp, voxel)
@@ -129,26 +136,35 @@ class CustomDataloader(keras.utils.Sequence):
             if len(dp) < self.num_points_set:
                 dp = self.__add_padding(self, dp)
 
-            if label_src.shape.numel() < dp.shape[0]:
-                n_repeats = dp.shape[0] - label_src.shape.numel()
-                label_src = self.__align_lbls(label_src, n_repeats)
-
-            if label_src.shape.numel() > dp.shape[0]:
-                label_src = self.__shorten_lbls(label_src, self.num_points_set)
-
-            label_np = label_src.numpy().astype(np.int32)
             points = dp.to_numpy()
-            data[i,] = points
-            label[i] = self.to_one_hot_enc_lbls(label_np)
-
-            fpfh_small, normals_small = self.get_fpfh(self, points) #dims npointsx33 & npointsx3
+            fpfh, normals = self.get_fpfh(points, voxel)
+            data[i, 0: 3 * self.num_points_set] = normals
+            data[i, 3 * self.num_points_set: 36 * self.num_points_set] = fpfh
+            data[i, 36 * self.num_points_set] = var_x
+            data[i, 36 * self.num_points_set + 1] = var_y
+            data[i, 36 * self.num_points_set + 2] = var_z
+            data[i, 36 * self.num_points_set + 3] = skew_x
+            data[i, 36 * self.num_points_set + 4] = skew_y
+            data[i, 36 * self.num_points_set + 5] = skew_z
+            data[i, 36 * self.num_points_set + 6] = skew_x
+            data[i, 36 * self.num_points_set + 7] = proportion
+            data[i, 36 * self.num_points_set + 8] = density
+            data[i, 36 * self.num_points_set + 8:-1] = com
+            label[i] = self.to_one_hot_enc_lbls(label_unique)
 
         return data, label
 
-    def get_fpfh(self, points):
+    def to_one_hot_enc_lbls(self, labels):
+        get_index_or_negative_one = lambda label: self.label_to_index.get(label, -1)
+        vectorized_function = np.vectorize(get_index_or_negative_one)
+        label_indices = vectorized_function(labels)
+        one_hot_labels = np.eye(self.n_classes)[label_indices+1]
+        return one_hot_labels
+
+    def get_fpfh(self, points, voxel):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
-        fpfh_o3d = self.preprocess_point_cloud(pcd, self.voxel_size)
+        fpfh_o3d = self.preprocess_point_cloud(pcd, voxel)
         fpfh = np.asarray(fpfh_o3d.data)
         normals_points = np.asarray(pcd.normals)
 
@@ -166,14 +182,6 @@ class CustomDataloader(keras.utils.Sequence):
             pcd,
             o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
         return pcd_fpfh
-
-
-    def to_one_hot_enc_lbls(self, labels):
-        get_index_or_negative_one = lambda label: self.label_to_index.get(label, -1)
-        vectorized_function = np.vectorize(get_index_or_negative_one)
-        label_indices = vectorized_function(labels)
-        one_hot_labels = np.eye(self.n_classes)[label_indices + 1]
-        return one_hot_labels
 
     def mask_unknown(self, array):
         mask = ~np.isin(array, list(np.array(list(self.label_to_index.values()))))
@@ -279,6 +287,7 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
     train_loader = CustomDataloader(train_df, dictionary, True, ARGS)
     test_loader = CustomDataloader(test_df, dictionary, False, ARGS)
 
+
     lr_schedule = keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate=ARGS.lr,
         decay_steps=steps_per_epoch * 5,
@@ -292,7 +301,7 @@ def train(ARGS, train_df, test_df, max_voxel, segmentnet):
         metrics=["accuracy"]
     )
 
-    checkpoint_filepath = f'{ARGS.path_model}\checkpoint.weights.h5'
+    checkpoint_filepath = f'{ARGS.path_model}\checkpoint_contextnet.weights.h5'
     checkpoint_callback = keras.callbacks.ModelCheckpoint(
         checkpoint_filepath,
         monitor="val_loss",
@@ -331,95 +340,67 @@ def mlp_block(x, filters, name):
     return layers.Activation("relu", name=f"{name}_relu")(x)
 
 
-def get_segmentation_model(n_classes, ARGS):
-    input_points = keras.Input(shape=(ARGS.num_points, 3))
+def get_segmentation_model(ARGS, n_classes):
 
-    # PointNet Classification Network.
-    transformed_inputs = transformation_block(
-        input_points, num_features=3, name="input_transformation_block"
-    )
-    features_64 = conv_block(transformed_inputs, filters=64, name="features_64")
-    features_128_1 = conv_block(features_64, filters=128, name="features_128_1")
-    features_128_2 = conv_block(features_128_1, filters=128, name="features_128_2")
-    transformed_features = transformation_block(
-        features_128_2, num_features=128, name="transformed_features"
-    )
-    features_512 = conv_block(transformed_features, filters=512, name="features_512")
-    features_2048 = conv_block(features_512, filters=2048, name="pre_maxpool_block")
-    global_features = layers.MaxPool1D(pool_size=ARGS.num_points, name="global_features")(
-        features_2048
-    )
-    global_features = keras.ops.tile(global_features, [1, ARGS.num_points, 1])
-
-    # Segmentation head.
-    segmentation_input = layers.Concatenate(name="segmentation_input")(
-        [
-            features_64,
-            features_128_1,
-            features_128_2,
-            transformed_features,
-            features_512,
-            global_features,
-        ]
-    )
-    segmentation_features = conv_block(
-        segmentation_input, filters=128, name="segmentation_features"
-    )
-    outputs = layers.Conv1D(
-        n_classes, kernel_size=1, activation="softmax", name="segmentation_head"
-    )(segmentation_features)
-    return keras.Model(input_points, outputs)
-
-
-def transformation_net(inputs, num_features, name):
-    """
-    The `filters` values come from the original paper:
-    https://arxiv.org/abs/1612.00593.
-    """
-    x = conv_block(inputs, filters=64, name=f"{name}_1")
-    x = conv_block(x, filters=128, name=f"{name}_2")
-    x = conv_block(x, filters=1024, name=f"{name}_3")
-    x = layers.GlobalMaxPooling1D()(x)
-    x = mlp_block(x, filters=512, name=f"{name}_1_1")
-    x = mlp_block(x, filters=256, name=f"{name}_2_1")
-    return layers.Dense(
-        num_features * num_features,
-        kernel_initializer="zeros",
-        bias_initializer=keras.initializers.Constant(np.eye(num_features).flatten()),
-        activity_regularizer=OrthogonalRegularizer(num_features),
-        name=f"{name}_final",
-    )(x)
-
-
-def transformation_block(inputs, num_features, name):
-    transformed_features = transformation_net(inputs, num_features, name=name)
-    transformed_features = layers.Reshape((num_features, num_features))(
-        transformed_features
-    )
-    return layers.Dot(axes=(2, 1), name=f"{name}_mm")([inputs, transformed_features])
+    model = keras.Sequential()
+    model.add(layers.Input(shape=(36 * ARGS.num_points + 12,)))
+    model.add(layers.Dense(8192))
+    model.add(layers.LeakyReLU(negative_slope=ARGS.leaky_slope))
+    model.add(layers.Dense(4096))
+    model.add(layers.LeakyReLU(negative_slope=ARGS.leaky_slope))
+    model.add(layers.Dense(2048))
+    model.add(layers.LeakyReLU(negative_slope=ARGS.leaky_slope))
+    model.add(layers.Dense(512))
+    model.add(layers.LeakyReLU(negative_slope=ARGS.leaky_slope))
+    model.add(layers.Dense(128))
+    model.add(layers.LeakyReLU(negative_slope=ARGS.leaky_slope))
+    model.add(layers.Dense(n_classes, activation="softmax"))
+    return model
 
 
 def get_dataset():
     search_string: str = 'data_df'
-    row_names = ['path', 'voxel_size', 'labels']
+    row_names = ['path', 'voxel_size', 'labels',  'point_variance_x', 'point_variance_y', 'point_variance_z',
+                 'point_skew_x', 'point_skew_y', 'point_skew_z', 'rel_proportion', 'density', 'weight', 'com']
     df_paths = pd.DataFrame(index=row_names)
 
     for filename in os.listdir(ARGS.path):
         if filename.endswith(".pkl") and search_string in filename:
             file_path = os.path.join(ARGS.path, filename)
 
-            try:
-                # Load the dataframe from pickle file
-                df = pd.read_pickle(file_path)
-                df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
-                del df
-                gc.collect()
-            except Exception as e:
-                print(f"Failed to load {filename}: {e}")
+            if not ARGS.omit_single_masks:
 
-    dictionary = pd.read_pickle(ARGS.dictionaryfile)
-    n_classes = len(dictionary)+1
+                try:
+                    df = pd.read_pickle(file_path)
+                    cols_to_drop = []
+
+                    for col in df.columns:
+                        if 'assembly' in df.loc['path', col]:
+                            cols_to_drop.append(col)
+
+                    # Drop the columns from the DataFrame
+                    df = df.drop(cols_to_drop, axis=1)
+
+                    df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
+                    del df
+                    gc.collect()
+                except Exception as e:
+                    print(f"Failed to load {filename}: {e}")
+
+            else:
+
+                try:
+                    # Load the dataframe from pickle file
+                    df = pd.read_pickle(file_path)
+                    df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
+                    del df
+                    gc.collect()
+                except Exception as e:
+                    print(f"Failed to load {filename}: {e}")
+
     max_voxel = df_paths.loc['voxel_size'].max()
+    dictionary = pd.read_pickle(ARGS.dictionaryfile)
+    n_classes = len(dictionary) + 1
     train_df, test_df = train_test_split(df_paths.T, test_size=0.2, random_state=42)
     return train_df.T, test_df.T, n_classes, max_voxel
 
