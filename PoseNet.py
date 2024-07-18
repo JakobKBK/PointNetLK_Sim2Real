@@ -15,7 +15,7 @@ import gc
 def options(argv=None):
     # io settings.
     parser = argparse.ArgumentParser(description='PoseNet')
-    parser.add_argument('--path', default=r'C:\MaH_Kretschmer\data\train_data\DEMO_EMO', type=str,
+    parser.add_argument('--path', default=r'D:\data\train_data\DEMO_EMO', type=str,
                         metavar='PATH', help='path to data directory')
     parser.add_argument('--outfile', type=str, default='./logs/220524_train_log',
                         metavar='BASENAME', help='output filename (prefix)')
@@ -23,13 +23,13 @@ def options(argv=None):
     # settings for input data
     parser.add_argument('--data_type', default='synthetic', type=str,
                         metavar='DATASET', help='whether data is synthetic or real')
-    parser.add_argument('--dictionaryfile', type=str, default=r'C:\MaH_Kretschmer\data\train_data\DEMO_EMO\dictionary.pkl',
+    parser.add_argument('--dictionaryfile', type=str, default=r'D:\data\train_data\DEMO_EMO\dictionary.pkl',
                         metavar='PATH', help='path to the categories to be trained')
     parser.add_argument('--num_points', default=2048, type=int,
                         metavar='N', help='points in point-cloud.')
     parser.add_argument('--min_points', default=32, type=int,
                         metavar='N', help='minimum number of points in mask to be considered for training.')
-    parser.add_argument('--workers', default=1, type=int,
+    parser.add_argument('--workers', default=4, type=int,
                         metavar='N', help='number of data loading workers')
 
     # settings for training.
@@ -98,7 +98,7 @@ class CustomDataloader(keras.utils.Sequence):
         indexes = self.indexes[idx * ARGS.batch_size:(idx + 1) * ARGS.batch_size]
         data_a = np.empty((ARGS.batch_size, ARGS.num_points, 3))
         data_b = np.empty((ARGS.batch_size, ARGS.num_points, 3))
-        label = np.empty((ARGS.batch_size, ARGS.num_points, self.n_classes), dtype=int)
+        label = np.empty((ARGS.batch_size, 8), dtype=int)
         j = 0
         for i, idx in enumerate(indexes):
             if j < ARGS.batch_size:
@@ -137,21 +137,22 @@ class CustomDataloader(keras.utils.Sequence):
                             points = dp.to_numpy()
                             data_a[j,] = points
                             points_transformed, dual_quat = self.transform_points(points)
-                            data_b = points_transformed
-                            label[j] = dual_quat
+                            data_b[j,] = points_transformed
+                            dual_quat_flat = np.concatenate(dual_quat)
+                            label[j] = dual_quat_flat
                             j += 1
 
                 else:
-                    return data_a, data_b, label
+                    return (data_a, data_b), label
 
-        return data_a, data_b, label
+        return (data_a, data_b), label
 
     def transform_points(self, points):
 
-        q, qd = self.random_rotation_translation()
-        points_transformed = self.apply_dual_quaternion_to_pointcloud(points, q, qd)
+        q, qd, translation_3d = self.random_rotation_translation()
+        points_transformed = self.apply_dual_quaternion_to_pointcloud(points, q, qd, translation_3d[1:])
 
-        return points_transformed, (q, qd)
+        return points_transformed, (q, translation_3d)
 
     def random_rotation_translation(self):
         # Random angle between 0 and 2*pi
@@ -173,11 +174,12 @@ class CustomDataloader(keras.utils.Sequence):
         translation = np.random.uniform(-1, 1, 3)
 
         # Quaternion for translation (dual part)
-        translation_quat = [0] + translation
+        translation_quat = [0] + translation.tolist()
+        translation_quat = np.array(translation_quat)
         qd = self.quaternion_multiply(translation_quat, q)
         qd = [0.5 * x for x in qd]
 
-        return q, qd
+        return q, np.array(qd), translation_quat
 
     def quaternion_multiply(self, q1, q2):
         """
@@ -193,21 +195,17 @@ class CustomDataloader(keras.utils.Sequence):
             w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
         ]
 
-    def apply_dual_quaternion_to_pointcloud(self, cloud, q, qd):
+    def apply_dual_quaternion_to_pointcloud(self, cloud, q, qd, translation_3d):
         # Convert quaternion to rotation matrix
         q_mat = self.quaternion_to_rotation_matrix(q)
         transformed_cloud = np.dot(cloud, q_mat.T)
 
-        # Extract translation from dual quaternion
-        translation = 2 * qd * q.conjugate()
-        translation = np.array([translation.x, translation.y, translation.z])
-
         # Apply translation
-        transformed_cloud += translation
+        transformed_cloud += translation_3d
 
         return transformed_cloud
 
-    def quaternion_to_rotation_matrix(q):
+    def quaternion_to_rotation_matrix(self, q):
         """Convert a quaternion into a 3x3 rotation matrix."""
         w, x, y, z = q
         return np.array([
@@ -356,7 +354,7 @@ class OrthogonalRegularizer(keras.regularizers.Regularizer):
         return config
 
 
-def train(ARGS, train_df, test_df, max_voxel, posenet):
+def train(ARGS, train_df, test_df, max_voxel, siam_posenet):
     total_training_examples = len(train_df.columns) + len(test_df.columns)
     steps_per_epoch = total_training_examples // ARGS.batch_size
     total_training_steps = steps_per_epoch * ARGS.max_epochs
@@ -374,7 +372,7 @@ def train(ARGS, train_df, test_df, max_voxel, posenet):
         staircase=True,
     )
 
-    posenet.compile(
+    siam_posenet.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
         loss='mean_squared_error',
         metrics=["accuracy"]
@@ -391,7 +389,7 @@ def train(ARGS, train_df, test_df, max_voxel, posenet):
         initial_value_threshold=None,
     )
 
-    history = posenet.fit(
+    history = siam_posenet.fit(
         train_loader,
         validation_data=test_loader,
         batch_size=ARGS.batch_size,
@@ -399,12 +397,12 @@ def train(ARGS, train_df, test_df, max_voxel, posenet):
         callbacks=[checkpoint_callback],
     )
 
-    posenet.load_weights(checkpoint_filepath)
-    return posenet, history
+    siam_posenet.load_weights(checkpoint_filepath)
+    return siam_posenet, history
 
 
-def conv_block(x, filters, name):
-    x = layers.Conv1D(filters, kernel_size=1, padding="valid", name=f"{name}_conv")(x)
+def conv_block(x, filters, name, kernel_size=1):
+    x = layers.Conv1D(filters, kernel_size, padding="valid", name=f"{name}_conv")(x)
     x = layers.BatchNormalization(name=f"{name}_batch_norm")(x)
     return layers.Activation("relu", name=f"{name}_relu")(x)
 
@@ -425,11 +423,52 @@ def get_siamese_model(n_classes, ARGS):
     processed_a = posenet(input_a)
     processed_b = posenet(input_b)
 
-    diff = tf.abs(processed_a - processed_b)
-    predictions = layers.Dense(1, activation='sigmoid')(diff)
+    reshaped_a = layers.Reshape((512, 512))(processed_a)
+    reshaped_b = layers.Reshape((512, 512))(processed_b)
 
+    concatenated = layers.Concatenate(axis=-1)([reshaped_a, reshaped_b])
+    features_64 = conv_block(concatenated, filters=64, name="features_64", kernel_size=1)
+    features_128_1 = conv_block(features_64, filters=128, name="features_128_1", kernel_size=1)
+    features_128_2 = conv_block(features_128_1, filters=128, name="features_128_2", kernel_size=1)
+
+    # x = layers.Conv2D(64, kernel_size=(64, 128), activation='relu', padding='same')(concatenated)
+    # x = layers.Dropout(0.5)(x)  # Adding dropout for regularization
+    # x = layers.Conv2D(32, kernel_size=(64, 64), activation='relu', padding='same')(x)
+    # x = layers.Dropout(0.3)(x)  # Additional dropout layer
+    # x = layers.Conv2D(16, kernel_size=(64, 64), activation='relu', padding='same')(x)
+    # x = layers.Dropout(0.2)(x)  # Adding dropout for regularization
+    # x = layers.Conv2D(8, kernel_size=(64, 64), activation='relu', padding='same')(x)
+    # x = layers.Dropout(0.1)(x)  # Additional dropout layer
+    # x = layers.Flatten()(x)
+
+    pose_input = layers.Concatenate(name="segmentation_input")(
+        [
+            features_64,
+            features_128_1,
+            features_128_2,
+        ]
+    )
+    pose_features = conv_block(
+        pose_input, filters=128, name="segmentation_features", kernel_size=1
+    )
+    flat_features = layers.Flatten()(pose_features)
+    predictions = layers.Dense(8, activation='sigmoid')(flat_features)
     model = keras.models.Model(inputs=[input_a, input_b], outputs=predictions)
     return model
+
+def compute_transformation(features):
+    """
+    Custom function to compute translation and rotation.
+    Assume features is a list [processed_a, processed_b] where each is of shape (batch_size, feature_dim).
+
+    For example purposes, let's concatenate them and pass through a small network.
+    """
+    concatenated = tf.concat(features, axis=-1)
+    # Example network to compute the translation and rotation.
+    # Adjust this network architecture to suit the actual computation needed.
+    x = layers.Dense(128, activation='relu')(concatenated)
+    output = layers.Dense(8)(x)  # Output layer for 8 components
+    return output
 
 
 def get_segmentation_model(n_classes, ARGS):
@@ -466,10 +505,9 @@ def get_segmentation_model(n_classes, ARGS):
     segmentation_features = conv_block(
         segmentation_input, filters=128, name="segmentation_features"
     )
-    outputs = layers.Conv1D(
-        n_classes, kernel_size=1, activation="relu", name="segmentation_head"
-    )(segmentation_features)
-    return keras.Model(input_points, outputs)
+    flat_features = layers.Flatten()(segmentation_features)
+
+    return keras.Model(inputs=input_points, outputs=flat_features)
 
 
 def transformation_net(inputs, num_features, name):
@@ -521,7 +559,7 @@ def get_dataset():
 
                     # Drop the columns from the DataFrame
                     df = df.drop(cols_to_drop, axis=1)
-
+                    df = update_paths(df, 'path', 'C:\\MaH_Kretschmer\\data\\train_data\\DEMO_EMO', ARGS.path)
                     df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
                     del df
                     gc.collect()
@@ -533,6 +571,7 @@ def get_dataset():
                 try:
                     # Load the dataframe from pickle file
                     df = pd.read_pickle(file_path)
+                    df = update_paths(df, 'path', 'C:\\MaH_Kretschmer\\data\\train_data\\DEMO_EMO', ARGS.path)
                     df_paths = pd.concat([df_paths, df.loc[row_names]], axis=1)
                     del df
                     gc.collect()
@@ -542,8 +581,35 @@ def get_dataset():
     dictionary = pd.read_pickle(ARGS.dictionaryfile)
     n_classes = len(dictionary)+1
     max_voxel = df_paths.loc['voxel_size'].max()
+    df_paths = update_paths(df_paths, 'path', 'C:\\MaH_Kretschmer\\data\\train_data\\DEMO_EMO', ARGS.path)
     train_df, test_df = train_test_split(df_paths.T, test_size=0.2, random_state=42)
     return train_df.T, test_df.T, n_classes, max_voxel
+
+
+def update_paths(df, row_name, old_path, new_path):
+    """
+    Replaces a substring in all the paths within a specific column of a pandas DataFrame.
+
+    Parameters:
+        df (pd.DataFrame): The DataFrame containing the paths.
+        row_name (str): The row in the DataFrame that contains the paths as strings.
+        old_path (str): The substring within the paths that needs to be replaced.
+        new_path (str): The new substring that will replace the old substring.
+
+    Returns:
+        pd.DataFrame: A DataFrame with the paths in the specified column updated.
+    """
+    # Check if the specified row exists in the DataFrame
+    if row_name in df.index:
+        for column in df.columns:
+            if isinstance(df.at[row_name, column], str):  # Check if the cell contains a string
+                old_str = df.at[row_name, column]
+                df.at[row_name, column] = df.at[row_name, column].replace(old_path, new_path)
+                print(f'Changed path {old_str} to {df.at[row_name, column]}')
+    else:
+        raise ValueError(f"The row '{row_name}' does not exist in the DataFrame.")
+
+    return df
 
 
 def get_unique_lbls(df_row):
