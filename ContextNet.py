@@ -37,7 +37,7 @@ def options(argv=None):
                         metavar='N', help='mini-batch size')
     parser.add_argument('--max_iter', default=1e3, type=int,
                         metavar='N', help='max iter voxel down')
-    parser.add_argument('--max_epochs', default=6, type=int,
+    parser.add_argument('--max_epochs', default=20, type=int,
                         metavar='N', help='number of total epochs to run')
     parser.add_argument('--start_epoch', default=0, type=int,
                         metavar='N', help='manual epoch number')
@@ -49,8 +49,8 @@ def options(argv=None):
                         metavar='D', help='learning rate')
     parser.add_argument('--decay_rate', type=float, default=1e-4,
                         metavar='D', help='decay rate of learning rate')
-    parser.add_argument('--omit_single_masks', type=bool, default=False,
-                        metavar='BOOL', help='wether to omit masked single part pointclouds')
+    parser.add_argument('--train_on_single_masks', type=bool, default=True,
+                        metavar='BOOL', help='wether to train solely on single part pointclouds')
     parser.add_argument('--path_model', type=str, default=r'C:\MaH_Kretschmer\data\models',
                         metavar='PATH', help='safe path for trained model .keras (prefix) & checkpoints')
     parser.add_argument('--leaky_slope', type=float, default=0.1,
@@ -74,7 +74,7 @@ def main(ARGS):
     train_df, test_df, n_classes, max_voxel = get_dataset()
     contextnet = get_model(ARGS, n_classes)
     model, history = train(ARGS, train_df, test_df, max_voxel, contextnet)
-    model.save(f'{ARGS.path_model}\contextnet.keras')
+    model.save(f'{ARGS.path_model}\contextnet_v1.keras')
 
 
 class CustomDataloader(keras.utils.Sequence):
@@ -305,7 +305,7 @@ def train(ARGS, train_df, test_df, max_voxel, contextnet):
         metrics=["accuracy"]
     )
 
-    checkpoint_filepath = f'{ARGS.path_model}\checkpoint_contextnet.weights.h5'
+    checkpoint_filepath = f'{ARGS.path_model}\checkpoint_contextnet_v1.weights.h5'
     checkpoint_callback = keras.callbacks.ModelCheckpoint(
         checkpoint_filepath,
         monitor="val_loss",
@@ -347,7 +347,7 @@ def mlp_block(x, filters, name):
 def get_model(ARGS, n_classes):
 
     model = keras.Sequential()
-    model.add(layers.Input(shape=(36 * ARGS.num_points + 12,)))
+    model.add(layers.Input(shape=(36 * ARGS.num_points + 11,)))
     model.add(layers.Dense(8192))
     model.add(layers.LeakyReLU(negative_slope=ARGS.leaky_slope))
     model.add(layers.Dense(4096))
@@ -372,7 +372,7 @@ def get_dataset():
         if filename.endswith(".pkl") and search_string in filename:
             file_path = os.path.join(ARGS.path, filename)
 
-            if not ARGS.omit_single_masks:
+            if ARGS.train_on_single_masks:
 
                 try:
                     df = pd.read_pickle(file_path)
